@@ -1,0 +1,167 @@
+# Source of truth for owogametools/ro-farmP .github/workflows/release.yml
+# Bootstrap / re-sync onto farmP main when this file changes.
+#
+# Secrets (farmP repo):
+#   RO_FARM_ARTIFACT_READ_TOKEN
+#     - fine-grained PAT (preferred): resource owner with access to private owogametools/ro-farm only
+#       Permissions: Actions Read, Metadata Read (Contents Read optional)
+#     - classic PAT: repo scope (read private repo Actions artifacts)
+#     Used only to download Actions artifacts from ro-farm. Release create uses GITHUB_TOKEN.
+#
+# Secrets (ro-farm repo, companion):
+#   RO_FARMP_RELEASE_TOKEN — fire repository_dispatch on farmP (Contents access on farmP)
+
+name: Publish RoFarmer Release
+
+on:
+  repository_dispatch:
+    types: [ro-farmer-release]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (e.g. v1.1.1)
+        required: true
+        type: string
+      source_run_id:
+        description: ro-farm Actions run id that owns the artifact
+        required: true
+        type: string
+      artifact_name:
+        description: Artifact name uploaded by ro-farm
+        required: false
+        default: RoFarmer-win-x64
+        type: string
+      source_repo:
+        description: Source repository (owner/name)
+        required: false
+        default: owogametools/ro-farm
+        type: string
+      version:
+        description: Optional display version (defaults to tag without leading v)
+        required: false
+        type: string
+
+# farmP Actions policy is local_only — do not use marketplace actions (uses:).
+# Only shell steps + preinstalled gh/curl.
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve payload
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            TAG='${{ github.event.client_payload.tag }}'
+            VERSION='${{ github.event.client_payload.version }}'
+            RUN_ID='${{ github.event.client_payload.source_run_id }}'
+            SOURCE_REPO='${{ github.event.client_payload.source_repo }}'
+            ARTIFACT_NAME='${{ github.event.client_payload.artifact_name }}'
+          else
+            TAG='${{ inputs.tag }}'
+            VERSION='${{ inputs.version }}'
+            RUN_ID='${{ inputs.source_run_id }}'
+            SOURCE_REPO='${{ inputs.source_repo }}'
+            ARTIFACT_NAME='${{ inputs.artifact_name }}'
+          fi
+
+          if [ -z "$TAG" ] || [ -z "$RUN_ID" ]; then
+            echo "tag and source_run_id are required" >&2
+            exit 1
+          fi
+          if [ -z "${SOURCE_REPO:-}" ]; then
+            SOURCE_REPO='owogametools/ro-farm'
+          fi
+          if [ -z "${ARTIFACT_NAME:-}" ]; then
+            ARTIFACT_NAME='RoFarmer-win-x64'
+          fi
+          if [ -z "${VERSION:-}" ]; then
+            VERSION="${TAG#v}"
+          fi
+
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "source_run_id=$RUN_ID"
+            echo "source_repo=$SOURCE_REPO"
+            echo "artifact_name=$ARTIFACT_NAME"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "tag=$TAG version=$VERSION run_id=$RUN_ID repo=$SOURCE_REPO artifact=$ARTIFACT_NAME"
+
+      - name: Download artifact from private ro-farm
+        env:
+          GH_TOKEN: ${{ secrets.RO_FARM_ARTIFACT_READ_TOKEN }}
+          SOURCE_REPO: ${{ steps.meta.outputs.source_repo }}
+          RUN_ID: ${{ steps.meta.outputs.source_run_id }}
+          ARTIFACT_NAME: ${{ steps.meta.outputs.artifact_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "RO_FARM_ARTIFACT_READ_TOKEN secret is missing on farmP" >&2
+            exit 1
+          fi
+
+          mkdir -p work
+          cd work
+
+          echo "Listing artifacts for $SOURCE_REPO run $RUN_ID"
+          gh api "repos/${SOURCE_REPO}/actions/runs/${RUN_ID}/artifacts" > artifacts.json
+          ARTIFACT_ID="$(jq -r --arg n "$ARTIFACT_NAME" '.artifacts[] | select(.name==$n) | .id' artifacts.json | head -n1)"
+          if [ -z "$ARTIFACT_ID" ] || [ "$ARTIFACT_ID" = "null" ]; then
+            echo "Artifact '$ARTIFACT_NAME' not found on run $RUN_ID" >&2
+            cat artifacts.json >&2
+            exit 1
+          fi
+          echo "Downloading artifact id=$ARTIFACT_ID"
+          gh api "repos/${SOURCE_REPO}/actions/artifacts/${ARTIFACT_ID}/zip" > artifact-bundle.zip
+          unzip -o artifact-bundle.zip
+          ZIP_PATH="$(find . -type f -name 'RoFarmer-win-x64.zip' | head -n1)"
+          if [ -z "$ZIP_PATH" ]; then
+            echo "RoFarmer-win-x64.zip not found inside artifact bundle" >&2
+            find . -type f >&2
+            exit 1
+          fi
+          cp -f "$ZIP_PATH" ../RoFarmer-win-x64.zip
+          ls -la ../RoFarmer-win-x64.zip
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          SOURCE_REPO: ${{ steps.meta.outputs.source_repo }}
+          RUN_ID: ${{ steps.meta.outputs.source_run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP='RoFarmer-win-x64.zip'
+          test -f "$ZIP"
+
+          NOTES="RoFarmer ${VERSION} (win-x64 single-file)
+
+          Ship contents inside \`RoFarmer-win-x64.zip\`:
+          - \`RoFarmer.exe\`
+          - \`img/\` (vision templates)
+
+          Built from ${SOURCE_REPO} Actions run ${RUN_ID}."
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists — uploading asset with --clobber"
+            gh release upload "$TAG" "$ZIP" --clobber
+            gh release edit "$TAG" --title "$TAG" --notes "$NOTES" --latest
+          else
+            echo "Creating release $TAG"
+            gh release create "$TAG" "$ZIP" \
+              --title "$TAG" \
+              --notes "$NOTES" \
+              --latest
+          fi
+
+          gh release view "$TAG"
