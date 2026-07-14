@@ -42,7 +42,7 @@ on:
         type: string
 
 # farmP Actions policy is local_only — do not use marketplace actions (uses:).
-# Only shell steps + preinstalled gh/curl.
+# Only shell steps + preinstalled gh/curl/jq.
 
 permissions:
   contents: write
@@ -111,15 +111,28 @@ jobs:
           mkdir -p work
           cd work
 
-          echo "Listing artifacts for $SOURCE_REPO run $RUN_ID"
-          gh api "repos/${SOURCE_REPO}/actions/runs/${RUN_ID}/artifacts" > artifacts.json
-          ARTIFACT_ID="$(jq -r --arg n "$ARTIFACT_NAME" '.artifacts[] | select(.name==$n) | .id' artifacts.json | head -n1)"
-          if [ -z "$ARTIFACT_ID" ] || [ "$ARTIFACT_ID" = "null" ]; then
-            echo "Artifact '$ARTIFACT_NAME' not found on run $RUN_ID" >&2
-            cat artifacts.json >&2
+          # Retry: artifact API can lag briefly after the producing job finishes.
+          ARTIFACT_ID=""
+          for attempt in $(seq 1 12); do
+            echo "Listing artifacts for $SOURCE_REPO run $RUN_ID (attempt $attempt)"
+            if gh api "repos/${SOURCE_REPO}/actions/runs/${RUN_ID}/artifacts" > artifacts.json; then
+              ARTIFACT_ID="$(jq -r --arg n "$ARTIFACT_NAME" '.artifacts[] | select(.name==$n and .expired==false) | .id' artifacts.json | head -n1)"
+              if [ -n "$ARTIFACT_ID" ] && [ "$ARTIFACT_ID" != "null" ]; then
+                break
+              fi
+            fi
+            echo "Artifact '$ARTIFACT_NAME' not ready yet; sleeping 10s"
+            sleep 10
+          done
+
+          if [ -z "${ARTIFACT_ID:-}" ] || [ "$ARTIFACT_ID" = "null" ]; then
+            echo "Artifact '$ARTIFACT_NAME' not found on run $RUN_ID after retries" >&2
+            cat artifacts.json >&2 || true
             exit 1
           fi
+
           echo "Downloading artifact id=$ARTIFACT_ID"
+          # Binary-safe download (follow redirect to artifact storage)
           gh api "repos/${SOURCE_REPO}/actions/artifacts/${ARTIFACT_ID}/zip" > artifact-bundle.zip
           unzip -o artifact-bundle.zip
           ZIP_PATH="$(find . -type f -name 'RoFarmer-win-x64.zip' | head -n1)"
@@ -158,6 +171,7 @@ jobs:
             gh release edit "$TAG" --title "$TAG" --notes "$NOTES" --latest
           else
             echo "Creating release $TAG"
+            # Asset-only target repo: gh creates a lightweight tag on default branch if missing.
             gh release create "$TAG" "$ZIP" \
               --title "$TAG" \
               --notes "$NOTES" \
