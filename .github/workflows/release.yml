@@ -4,9 +4,10 @@
 # Secrets (farmP repo):
 #   RO_FARM_ARTIFACT_READ_TOKEN
 #     - fine-grained PAT (preferred): resource owner with access to private owogametools/ro-farm only
-#       Permissions: Actions Read, Metadata Read (Contents Read optional)
-#     - classic PAT: repo scope (read private repo Actions artifacts)
-#     Used only to download Actions artifacts from ro-farm. Release create uses GITHUB_TOKEN.
+#       Permissions: Contents Read, Metadata Read
+#     - classic PAT: repo scope (read private repo Releases)
+#     Used only to download private Release assets from ro-farm.
+#     Release create on farmP uses GITHUB_TOKEN (github-actions[bot]).
 #
 # Secrets (ro-farm repo, companion):
 #   RO_FARMP_RELEASE_TOKEN — fire repository_dispatch on farmP (Contents access on farmP)
@@ -22,19 +23,15 @@ on:
         description: Release tag (e.g. v1.1.1)
         required: true
         type: string
-      source_run_id:
-        description: ro-farm Actions run id that owns the artifact
-        required: true
-        type: string
-      artifact_name:
-        description: Artifact name uploaded by ro-farm
-        required: false
-        default: RoFarmer-win-x64
-        type: string
       source_repo:
         description: Source repository (owner/name)
         required: false
         default: owogametools/ro-farm
+        type: string
+      asset_name:
+        description: Release asset filename on private source
+        required: false
+        default: RoFarmer-win-x64.zip
         type: string
       version:
         description: Optional display version (defaults to tag without leading v)
@@ -59,26 +56,24 @@ jobs:
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             TAG='${{ github.event.client_payload.tag }}'
             VERSION='${{ github.event.client_payload.version }}'
-            RUN_ID='${{ github.event.client_payload.source_run_id }}'
             SOURCE_REPO='${{ github.event.client_payload.source_repo }}'
-            ARTIFACT_NAME='${{ github.event.client_payload.artifact_name }}'
+            ASSET_NAME='${{ github.event.client_payload.asset_name }}'
           else
             TAG='${{ inputs.tag }}'
             VERSION='${{ inputs.version }}'
-            RUN_ID='${{ inputs.source_run_id }}'
             SOURCE_REPO='${{ inputs.source_repo }}'
-            ARTIFACT_NAME='${{ inputs.artifact_name }}'
+            ASSET_NAME='${{ inputs.asset_name }}'
           fi
 
-          if [ -z "$TAG" ] || [ -z "$RUN_ID" ]; then
-            echo "tag and source_run_id are required" >&2
+          if [ -z "$TAG" ]; then
+            echo "tag is required" >&2
             exit 1
           fi
           if [ -z "${SOURCE_REPO:-}" ]; then
             SOURCE_REPO='owogametools/ro-farm'
           fi
-          if [ -z "${ARTIFACT_NAME:-}" ]; then
-            ARTIFACT_NAME='RoFarmer-win-x64'
+          if [ -z "${ASSET_NAME:-}" ]; then
+            ASSET_NAME='RoFarmer-win-x64.zip'
           fi
           if [ -z "${VERSION:-}" ]; then
             VERSION="${TAG#v}"
@@ -87,19 +82,18 @@ jobs:
           {
             echo "tag=$TAG"
             echo "version=$VERSION"
-            echo "source_run_id=$RUN_ID"
             echo "source_repo=$SOURCE_REPO"
-            echo "artifact_name=$ARTIFACT_NAME"
+            echo "asset_name=$ASSET_NAME"
           } >> "$GITHUB_OUTPUT"
 
-          echo "tag=$TAG version=$VERSION run_id=$RUN_ID repo=$SOURCE_REPO artifact=$ARTIFACT_NAME"
+          echo "tag=$TAG version=$VERSION repo=$SOURCE_REPO asset=$ASSET_NAME"
 
-      - name: Download artifact from private ro-farm
+      - name: Download private Release asset from ro-farm
         env:
           GH_TOKEN: ${{ secrets.RO_FARM_ARTIFACT_READ_TOKEN }}
           SOURCE_REPO: ${{ steps.meta.outputs.source_repo }}
-          RUN_ID: ${{ steps.meta.outputs.source_run_id }}
-          ARTIFACT_NAME: ${{ steps.meta.outputs.artifact_name }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          ASSET_NAME: ${{ steps.meta.outputs.asset_name }}
         shell: bash
         run: |
           set -euo pipefail
@@ -111,37 +105,26 @@ jobs:
           mkdir -p work
           cd work
 
-          # Retry: artifact API can lag briefly after the producing job finishes.
-          ARTIFACT_ID=""
+          # Retry: private release asset can lag briefly after create/upload.
           for attempt in $(seq 1 12); do
-            echo "Listing artifacts for $SOURCE_REPO run $RUN_ID (attempt $attempt)"
-            if gh api "repos/${SOURCE_REPO}/actions/runs/${RUN_ID}/artifacts" > artifacts.json; then
-              ARTIFACT_ID="$(jq -r --arg n "$ARTIFACT_NAME" '.artifacts[] | select(.name==$n and .expired==false) | .id' artifacts.json | head -n1)"
-              if [ -n "$ARTIFACT_ID" ] && [ "$ARTIFACT_ID" != "null" ]; then
-                break
-              fi
+            echo "Downloading $ASSET_NAME from $SOURCE_REPO@$TAG (attempt $attempt)"
+            if gh release download "$TAG" \
+              --repo "$SOURCE_REPO" \
+              --pattern "$ASSET_NAME" \
+              --clobber; then
+              break
             fi
-            echo "Artifact '$ARTIFACT_NAME' not ready yet; sleeping 10s"
+            echo "Asset not ready yet; sleeping 10s"
             sleep 10
           done
 
-          if [ -z "${ARTIFACT_ID:-}" ] || [ "$ARTIFACT_ID" = "null" ]; then
-            echo "Artifact '$ARTIFACT_NAME' not found on run $RUN_ID after retries" >&2
-            cat artifacts.json >&2 || true
+          if [ ! -f "$ASSET_NAME" ]; then
+            echo "Failed to download $ASSET_NAME from $SOURCE_REPO release $TAG" >&2
+            gh release view "$TAG" --repo "$SOURCE_REPO" >&2 || true
             exit 1
           fi
 
-          echo "Downloading artifact id=$ARTIFACT_ID"
-          # Binary-safe download (follow redirect to artifact storage)
-          gh api "repos/${SOURCE_REPO}/actions/artifacts/${ARTIFACT_ID}/zip" > artifact-bundle.zip
-          unzip -o artifact-bundle.zip
-          ZIP_PATH="$(find . -type f -name 'RoFarmer-win-x64.zip' | head -n1)"
-          if [ -z "$ZIP_PATH" ]; then
-            echo "RoFarmer-win-x64.zip not found inside artifact bundle" >&2
-            find . -type f >&2
-            exit 1
-          fi
-          cp -f "$ZIP_PATH" ../RoFarmer-win-x64.zip
+          cp -f "$ASSET_NAME" ../RoFarmer-win-x64.zip
           ls -la ../RoFarmer-win-x64.zip
 
       - name: Create or update GitHub Release
@@ -150,7 +133,6 @@ jobs:
           TAG: ${{ steps.meta.outputs.tag }}
           VERSION: ${{ steps.meta.outputs.version }}
           SOURCE_REPO: ${{ steps.meta.outputs.source_repo }}
-          RUN_ID: ${{ steps.meta.outputs.source_run_id }}
         shell: bash
         run: |
           set -euo pipefail
@@ -162,8 +144,9 @@ jobs:
           Ship contents inside \`RoFarmer-win-x64.zip\`:
           - \`RoFarmer.exe\`
           - \`img/\` (vision templates)
+          - \`tessdata/\`
 
-          Built from ${SOURCE_REPO} Actions run ${RUN_ID}."
+          Built from ${SOURCE_REPO} release ${TAG}."
 
           if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             echo "Release $TAG exists — uploading asset with --clobber"
@@ -172,7 +155,6 @@ jobs:
           else
             echo "Creating release $TAG"
             # Asset-only target repo: gh creates a lightweight tag on default branch if missing.
-            # Use --target main (or default branch) so tag can be created without a git checkout.
             gh release create "$TAG" "$ZIP" \
               --repo "${{ github.repository }}" \
               --title "$TAG" \
